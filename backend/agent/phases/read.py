@@ -11,6 +11,7 @@ from playwright.async_api import BrowserContext, async_playwright
 from playwright_stealth import Stealth
 
 from agent.brain.human_brain import HumanBrain
+from agent.browser.captcha_detector import page_has_captcha, url_is_blocked
 from agent.phases.search_planner import SearchPlanner, SearchStrategy
 
 logger = logging.getLogger(__name__)
@@ -161,9 +162,22 @@ class ReadPhase:
                 )
                 logger.info(f"DDG collected {len(raw_results)} raw results.")
 
+                # ---- CAPTCHA wall check on the DDG results page ----
+                if await page_has_captcha(search_page):
+                    logger.warning(
+                        "DDG returned a CAPTCHA/bot-wall — skipping this query."
+                    )
+                    return []
+
                 # ---- Step 2: Visit each URL for the full description ----
                 for item in raw_results[:8]:
                     try:
+                        if await url_is_blocked(item["url"]):
+                            logger.info(
+                                f"Skipping blocked portal URL: {item['url']}"
+                            )
+                            continue
+
                         full_desc = await self._fetch_full_job_description(
                             context, item["url"]
                         )
@@ -316,7 +330,7 @@ class ReadPhase:
                                 url = href
                                 break
 
-                        if url:
+                        if url and not await url_is_blocked(url):
                             # Fetch fuller description from the direct URL
                             full_desc = await self._fetch_full_job_description(
                                 context, url
@@ -361,6 +375,10 @@ class ReadPhase:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await self.brain.random_sleep(1.5, 3.0)
             await self.brain.handle_interruptions(page)
+
+            if await page_has_captcha(page):
+                logger.warning(f"CAPTCHA wall detected on job page — skipping: {url}")
+                return ""
 
             selectors_js = json.dumps(_DESC_SELECTORS)
             text: str = await page.evaluate(
