@@ -11,6 +11,7 @@ from playwright.async_api import BrowserContext, async_playwright
 from playwright_stealth import Stealth
 
 from agent.brain.human_brain import HumanBrain
+from agent.browser.captcha_detector import page_has_captcha, url_is_blocked
 from agent.phases.search_planner import SearchPlanner, SearchStrategy
 
 logger = logging.getLogger(__name__)
@@ -142,10 +143,10 @@ class ReadPhase:
         2. Visit each URL inside the same context to fetch the full description.
         """
         logger.info(f"DDG search: {query!r}")
+        # Only target ATS platforms that are not blocked (no captcha, automatable)
         full_query = (
             f"{query} "
-            "(site:lever.co OR site:ashbyhq.com OR "
-            "site:boards.greenhouse.io OR site:workable.com)"
+            "(site:jobs.lever.co OR site:jobs.ashbyhq.com)"
         )
         all_jobs: List[RawJob] = []
 
@@ -161,9 +162,22 @@ class ReadPhase:
                 )
                 logger.info(f"DDG collected {len(raw_results)} raw results.")
 
+                # ---- CAPTCHA wall check on the DDG results page ----
+                if await page_has_captcha(search_page):
+                    logger.warning(
+                        "DDG returned a CAPTCHA/bot-wall — skipping this query."
+                    )
+                    return []
+
                 # ---- Step 2: Visit each URL for the full description ----
                 for item in raw_results[:8]:
                     try:
+                        if await url_is_blocked(item["url"]):
+                            logger.info(
+                                f"Skipping blocked portal URL: {item['url']}"
+                            )
+                            continue
+
                         full_desc = await self._fetch_full_job_description(
                             context, item["url"]
                         )
@@ -316,7 +330,7 @@ class ReadPhase:
                                 url = href
                                 break
 
-                        if url:
+                        if url and not await url_is_blocked(url):
                             # Fetch fuller description from the direct URL
                             full_desc = await self._fetch_full_job_description(
                                 context, url
@@ -362,6 +376,10 @@ class ReadPhase:
             await self.brain.random_sleep(1.5, 3.0)
             await self.brain.handle_interruptions(page)
 
+            if await page_has_captcha(page):
+                logger.warning(f"CAPTCHA wall detected on job page — skipping: {url}")
+                return ""
+
             selectors_js = json.dumps(_DESC_SELECTORS)
             text: str = await page.evaluate(
                 f"""
@@ -405,16 +423,13 @@ class ReadPhase:
 
 def _company_from_url(url: str) -> str:
     """Extract a company slug from well-known ATS URL patterns."""
-    patterns = [
-        ("lever.co/", 1),
-        ("greenhouse.io/", 1),
-        ("ashbyhq.com/", 1),
-        ("workable.com/", 1),
-    ]
-    for pattern, segment_index in patterns:
+    # e.g. https://jobs.lever.co/acmecorp/role-id  → "acmecorp"
+    # e.g. https://jobs.ashbyhq.com/acmecorp/role-id → "acmecorp"
+    patterns = ["jobs.lever.co/", "jobs.ashbyhq.com/"]
+    for pattern in patterns:
         if pattern in url:
             try:
-                return url.split(pattern)[1].split("/")[segment_index - 1]
+                return url.split(pattern)[1].split("/")[0]
             except IndexError:
                 pass
     return "Unknown"
