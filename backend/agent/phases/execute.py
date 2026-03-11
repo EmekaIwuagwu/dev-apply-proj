@@ -5,7 +5,7 @@ import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from playwright.async_api import async_playwright
+from playwright.async_api import BrowserContext, Page, async_playwright
 from playwright_stealth import Stealth
 
 from agent.brain.human_brain import HumanBrain
@@ -140,16 +140,16 @@ class ExecutePhase:
             await self.brain.handle_interruptions(page)
 
             # ---- Try to reach the application form ----
-            on_form = await self._ensure_on_application_form(page, job)
-            if not on_form:
+            form_page = await self._ensure_on_application_form(context, page, job)
+            if not form_page:
                 return {
                     "status": "skipped",
                     "job": job,
                     "error": "Could not locate or reach the application form",
                 }
 
-            # ---- Multi-page form filling ----
-            submitted = await self._fill_and_submit(page, job)
+            # ---- Multi-page form filling (use form_page — may differ from page) ----
+            submitted = await self._fill_and_submit(form_page, job)
             if not submitted:
                 return {
                     "status": "skipped",
@@ -160,11 +160,11 @@ class ExecutePhase:
             # ---- Confirm success ----
             await self.brain.pause_after_submit()
             await asyncio.sleep(5)
-            await page.screenshot(
+            await form_page.screenshot(
                 path=f"debug_post_submit_{job.company}.png"
             )
 
-            content = (await page.content()).lower()
+            content = (await form_page.content()).lower()
             if any(kw in content for kw in _SUCCESS_KEYWORDS):
                 logger.info(f"Application submitted: {job.title} @ {job.company}")
                 return {"status": "submitted", "job": job}
@@ -179,21 +179,38 @@ class ExecutePhase:
             logger.error(f"Application crashed for {job.company}: {e}")
             return {"status": "failed", "job": job, "error": str(e)}
         finally:
-            await page.close()
+            try:
+                await page.close()
+            except Exception:
+                pass
+            # If the form was on a different tab, close that too
+            try:
+                if form_page is not None and form_page != page:
+                    await form_page.close()
+            except (NameError, Exception):
+                pass
 
     # ------------------------------------------------------------------
     # Navigate from listing → application form
     # ------------------------------------------------------------------
 
-    async def _ensure_on_application_form(self, page, job: Any) -> bool:
+    async def _ensure_on_application_form(
+        self, context: BrowserContext, page: Page, job: Any
+    ) -> Optional[Page]:
         """
-        Returns True once the page contains visible form fields.
-        Tries apply-button clicks and Lever-style /apply URL hack.
+        Navigates to the application form and returns the Page that contains it.
+        Returns None if the form cannot be reached.
+
+        Handles three scenarios:
+          1. Form already visible on the landing page.
+          2. Apply button click navigates the same tab to a form page.
+          3. Apply button click opens a NEW tab — we switch to that tab.
+        Includes Lever and Ashby URL fallbacks as a last resort.
         """
         filler = FormFiller(page, self.user, self.brain, self.preferences)
 
         if await self._has_visible_form(filler):
-            return True
+            return page
 
         logger.info(f"No form on landing page for {job.company} — seeking Apply button …")
 
@@ -204,39 +221,74 @@ class ExecutePhase:
                     continue
 
                 logger.info(f"Clicking apply button: {selector}")
+
+                # Record existing pages before click so we can detect new tabs
+                pages_before = set(context.pages)
+
                 try:
                     await self.brain.click_element(page, selector)
                 except Exception:
-                    await page.click(selector)
+                    try:
+                        await page.click(selector)
+                    except Exception:
+                        continue  # Can't click — try next selector
 
-                await asyncio.sleep(3)
+                # Brief wait for navigation / new tab to appear
+                await asyncio.sleep(2)
+
+                # Check if a new tab was opened
+                new_pages = [p for p in context.pages if p not in pages_before and not p.is_closed()]
+                if new_pages:
+                    new_tab: Page = new_pages[-1]
+                    try:
+                        await new_tab.wait_for_load_state("networkidle", timeout=15000)
+                    except Exception:
+                        pass
+                    await Stealth().apply_stealth_async(new_tab)
+                    logger.info(f"Apply button opened new tab: {new_tab.url}")
+                    new_filler = FormFiller(new_tab, self.user, self.brain, self.preferences)
+                    for _ in range(5):
+                        if await self._has_visible_form(new_filler):
+                            return new_tab
+                        await asyncio.sleep(2)
+                    # New tab opened but no form; close and try next selector
+                    await new_tab.close()
+                    continue
+
+                # Same-tab navigation — wait for load and poll for form
                 try:
                     await page.wait_for_load_state("networkidle", timeout=10000)
                 except Exception:
                     pass
 
-                # Poll for form appearance (up to 10 s)
                 for _ in range(5):
                     if await self._has_visible_form(filler):
-                        return True
+                        return page
                     await asyncio.sleep(2)
 
-                # Break on first button found even if form not yet visible
-                break
+                # No form found — continue to next selector
 
             except Exception as e:
                 logger.debug(f"Apply selector {selector!r} failed: {e}")
 
-        # Lever-specific direct /apply URL hack
-        if not await self._has_visible_form(filler):
-            if "lever.co" in page.url and "/apply" not in page.url:
-                apply_url = page.url.rstrip("/") + "/apply"
-                logger.info(f"Lever portal — trying direct apply URL: {apply_url}")
-                await page.goto(apply_url, wait_until="networkidle", timeout=30000)
-                if await self._has_visible_form(filler):
-                    return True
+        # ---- ATS-specific direct /apply URL fallbacks ----
+        current_url = page.url
 
-        return await self._has_visible_form(filler)
+        if "lever.co" in current_url and "/apply" not in current_url:
+            apply_url = current_url.rstrip("/") + "/apply"
+            logger.info(f"Lever portal — trying direct apply URL: {apply_url}")
+            await page.goto(apply_url, wait_until="networkidle", timeout=30000)
+            if await self._has_visible_form(filler):
+                return page
+
+        if "ashbyhq.com" in current_url and "/apply" not in current_url:
+            apply_url = current_url.rstrip("/") + "/apply"
+            logger.info(f"Ashby portal — trying direct apply URL: {apply_url}")
+            await page.goto(apply_url, wait_until="networkidle", timeout=30000)
+            if await self._has_visible_form(filler):
+                return page
+
+        return None if not await self._has_visible_form(filler) else page
 
     # ------------------------------------------------------------------
     # Multi-page form fill + final submit
