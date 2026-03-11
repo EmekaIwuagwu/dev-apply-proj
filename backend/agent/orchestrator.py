@@ -1,60 +1,58 @@
-import asyncio
+"""
+Orchestrator — coordinates the 3-phase pipeline for a single user:
+
+  Phase 1 — SEARCH  : Discover job listings via DDG (Lever + Ashby)
+  Phase 2 — PLAN    : Score & filter jobs with Gemini
+  Phase 3 — APPLY   : Fill and submit application forms
+"""
 import logging
 from datetime import datetime
+from pathlib import Path
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal
 from models.application import AgentRun, Application
 from models.user import JobPreference, User
-from agent.phases.execute import ExecutePhase
-from agent.phases.plan import PlanPhase
-from agent.phases.read import ReadPhase
 
 logger = logging.getLogger(__name__)
 
+_PROFILES_DIR = Path(__file__).parent / "profiles"
+
 
 async def run_agent_for_all_users() -> None:
-    """Entry point for the daily scheduled agent run."""
+    """Entry point for the daily scheduled run — processes all enabled users."""
     async with AsyncSessionLocal() as db:
         result = await db.execute(
-            select(User).where(
-                User.agent_enabled == True,
-                User.is_active == True,
-            )
+            select(User).where(User.agent_enabled == True, User.is_active == True)
         )
         users = result.scalars().all()
-        logger.info(f"Starting agent run for {len(users)} user(s).")
 
-        tasks = [run_agent_for_user(user.id) for user in users]
-        await asyncio.gather(*tasks, return_exceptions=True)
+    logger.info(f"Daily run: {len(users)} user(s) to process")
+    for user in users:
+        try:
+            await run_agent_for_user(str(user.id))
+        except Exception as e:
+            logger.error(f"Agent run failed for user {user.id}: {e}", exc_info=True)
 
 
 async def run_agent_for_user(user_id: str) -> None:
-    """
-    Coordinates the full 3-phase pipeline for a single user:
-      Phase 1 — READ   : Discover jobs via strategy-driven search
-      Phase 2 — PLAN   : Score & filter with Gemini
-      Phase 3 — EXECUTE: Fill & submit application forms
-    """
+    """Full pipeline for one user — creates an AgentRun record, then runs all 3 phases."""
     async with AsyncSessionLocal() as db:
-        # ---- Fetch user ----
-        user_result = await db.execute(
-            select(User).where(User.id == user_id)
-        )
-        user = user_result.scalar_one_or_none()
+        # Load user
+        u_result = await db.execute(select(User).where(User.id == user_id))
+        user = u_result.scalar_one_or_none()
         if not user:
-            logger.warning(f"User {user_id} not found — skipping.")
+            logger.warning(f"User {user_id} not found")
             return
 
-        # ---- Fetch preferences ----
-        pref_result = await db.execute(
+        # Load preferences
+        p_result = await db.execute(
             select(JobPreference).where(JobPreference.user_id == user_id)
         )
-        preferences = pref_result.scalar_one_or_none()
+        preferences = p_result.scalar_one_or_none()
 
-        # ---- Create AgentRun record ----
+        # Create run record
         run = AgentRun(
             user_id=user.id,
             status="running",
@@ -63,87 +61,90 @@ async def run_agent_for_user(user_id: str) -> None:
         db.add(run)
         await db.commit()
 
-        log_buf = []
+        log: list[str] = []
 
-        def log_event(msg: str) -> None:
-            formatted = f"[{datetime.utcnow().strftime('%H:%M:%S')}] {msg}"
-            log_buf.append(formatted)
-            logger.info(f"User {user.id}: {msg}")
+        def emit(msg: str) -> None:
+            ts = datetime.utcnow().strftime("%H:%M:%S")
+            log.append(f"[{ts}] {msg}")
+            logger.info(f"[{user.email}] {msg}")
 
         try:
-            log_event("Wakeup sequence initiated.")
+            emit("Agent wakeup.")
 
-            if not preferences:
-                log_event("No job preferences configured — skipping run.")
+            if not preferences or not getattr(preferences, "job_titles", None):
+                emit("No job preferences configured — skipping.")
                 run.status = "skipped"
+                run.completed_at = datetime.utcnow()
+                run.log_output = "\n".join(log)
                 await db.commit()
                 return
 
+            profile_dir = str(_PROFILES_DIR / str(user.id))
+
             # ----------------------------------------------------------
-            # PHASE 1: READ — job discovery
+            # PHASE 1 — SEARCH
             # ----------------------------------------------------------
-            log_event("PHASE 1: READ — starting job discovery …")
-            reader = ReadPhase(user, preferences)
-            raw_jobs = await reader.execute()
-            log_event(f"Discovery complete — {len(raw_jobs)} potential listing(s) found.")
+            emit("PHASE 1: Searching for jobs …")
+            from agent.search import discover_jobs
+            raw_jobs = await discover_jobs(user, preferences, profile_dir)
+            emit(f"Found {len(raw_jobs)} job listing(s).")
             run.total_jobs_found = len(raw_jobs)
+            await db.commit()
 
             if not raw_jobs:
-                log_event("No jobs discovered — ending run early.")
+                emit("No jobs found — ending run.")
                 run.status = "completed"
                 run.completed_at = datetime.utcnow()
-                run.log_output = "\n".join(log_buf)
+                run.log_output = "\n".join(log)
                 await db.commit()
                 return
 
             # ----------------------------------------------------------
-            # PHASE 2: PLAN — LLM scoring & filtering
+            # PHASE 2 — PLAN
             # ----------------------------------------------------------
-            log_event("PHASE 2: PLAN — analysing & scoring jobs …")
-            planner = PlanPhase(user, raw_jobs, preferences)   # preferences passed
-            planned_jobs = await planner.execute()
-            log_event(
-                f"Planning complete — {len(planned_jobs)} job(s) scheduled for application."
-            )
+            emit("PHASE 2: Scoring jobs …")
+            from agent.planner import plan_jobs
+            planned = await plan_jobs(user, raw_jobs, preferences)
+            emit(f"{len(planned)} job(s) passed the match threshold.")
 
-            if not planned_jobs:
-                log_event("No jobs passed the match threshold — ending run.")
+            if not planned:
+                emit("No jobs passed scoring — ending run.")
                 run.status = "completed"
                 run.total_skipped = len(raw_jobs)
                 run.completed_at = datetime.utcnow()
-                run.log_output = "\n".join(log_buf)
+                run.log_output = "\n".join(log)
                 await db.commit()
                 return
 
             # ----------------------------------------------------------
-            # PHASE 3: EXECUTE — browser automation
+            # PHASE 3 — APPLY
             # ----------------------------------------------------------
-            log_event("PHASE 3: EXECUTE — starting browser automation …")
-            executor = ExecutePhase(user, planned_jobs, preferences)  # preferences passed
-            results = await executor.execute()
+            emit("PHASE 3: Applying to jobs …")
+            from agent.applicator import Applicator
+            applicator = Applicator(user, preferences, profile_dir)
+            results = await applicator.run(planned)
 
-            # ---- Record results ----
-            total_applied = 0
-            total_failed = 0
-            total_skipped = 0
+            # Record results
+            n_submitted = n_skipped = n_failed = 0
+            from agent.notifications.service import send_success_email
 
             for res in results:
-                status = res.get("status", "failed")
+                status = res["status"]
                 job = res["job"]
 
                 if status == "submitted":
-                    total_applied += 1
+                    n_submitted += 1
                 elif status == "skipped":
-                    total_skipped += 1
+                    n_skipped += 1
                 else:
-                    total_failed += 1
+                    n_failed += 1
 
                 db_app = Application(
                     user_id=user.id,
                     job_title=job.title,
                     company_name=job.company,
                     job_url=job.url,
-                    job_description=job.description[:2000] if job.description else None,
+                    job_description=(job.description or "")[:2000],
                     platform=job.platform,
                     status=status,
                     ai_match_score=job.match_score,
@@ -154,21 +155,38 @@ async def run_agent_for_user(user_id: str) -> None:
                 )
                 db.add(db_app)
 
-            run.total_applied = total_applied
-            run.total_skipped = total_skipped
-            run.total_failed = total_failed
+                if status == "submitted":
+                    emit(f"Submitted: {job.title} @ {job.company}")
+                    try:
+                        await send_success_email(
+                            user_email=user.email,
+                            user_full_name=user.full_name,
+                            user_salutation=user.salutation,
+                            job_title=job.title,
+                            company_name=job.company,
+                            job_url=job.url,
+                            match_score=job.match_score / 100,
+                            applied_at=datetime.utcnow().strftime("%B %d, %Y at %H:%M UTC"),
+                            cover_note=job.cover_note,
+                        )
+                    except Exception as email_err:
+                        logger.warning(f"Email failed: {email_err}")
+
+            run.total_applied = n_submitted
+            run.total_skipped = n_skipped
+            run.total_failed = n_failed
             run.status = "completed"
             run.completed_at = datetime.utcnow()
-            run.log_output = "\n".join(log_buf)
-            log_event(
-                f"Run complete — Applied: {total_applied}, "
-                f"Skipped: {total_skipped}, Failed: {total_failed}"
+            emit(
+                f"Run complete — Submitted: {n_submitted}, "
+                f"Skipped: {n_skipped}, Failed: {n_failed}"
             )
 
         except Exception as e:
-            logger.error(f"Agent run failed for user {user.id}: {e}", exc_info=True)
+            logger.error(f"Pipeline failed for {user.email}: {e}", exc_info=True)
             run.status = "failed"
             run.completed_at = datetime.utcnow()
-            run.log_output = "\n".join(log_buf) + f"\n[ERROR] {e}"
+            log.append(f"[ERROR] {e}")
 
+        run.log_output = "\n".join(log)
         await db.commit()
