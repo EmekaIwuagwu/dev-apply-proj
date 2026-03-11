@@ -26,13 +26,8 @@ async def send_success_email(
     applied_at: str,
     cover_note: str,
 ) -> None:
-    """
-    Send an HTML confirmation email to the user.
-    Failures are logged but never re-raised — email should never block the agent.
-    """
     try:
-        template = _jinja.get_template("application_success.html")
-        html = template.render(
+        html = _jinja.get_template("application_success.html").render(
             salutation=user_salutation,
             full_name=user_full_name,
             job_title=job_title,
@@ -42,7 +37,6 @@ async def send_success_email(
             applied_at=applied_at,
             cover_note=cover_note,
         )
-
         msg = MIMEMultipart("alternative")
         msg["Subject"] = f"Application submitted to {company_name} — DevApply"
         msg["From"] = f"{settings.FROM_NAME} <{settings.FROM_EMAIL}>"
@@ -51,7 +45,6 @@ async def send_success_email(
 
         await asyncio.to_thread(_smtp_send, msg, user_email)
         logger.info(f"Email sent to {user_email} ({company_name})")
-
     except Exception as e:
         logger.error(f"Email failed for {user_email}: {e}")
 

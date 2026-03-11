@@ -18,7 +18,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    description="DevApply AI Agent — Backend API",
+    description="DevApply — AI Agent Backend (Vision-Driven)",
     version=settings.VERSION,
     lifespan=lifespan,
 )
@@ -42,7 +42,7 @@ app.include_router(applications.router, prefix="/api/applications", tags=["Appli
 
 @app.get("/")
 async def root():
-    return {"message": "DevApply API is running", "version": settings.VERSION}
+    return {"message": "DevApply Vision Agent is running", "version": settings.VERSION}
 
 
 if __name__ == "__main__":

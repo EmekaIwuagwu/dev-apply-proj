@@ -1,16 +1,21 @@
 """
-Orchestrator — coordinates the 3-phase pipeline for a single user:
+orchestrator.py — Coordinates the three-phase agent pipeline per user.
 
-  Phase 1 — SEARCH  : Discover job listings via DDG (Lever + Ashby)
-  Phase 2 — PLAN    : Score & filter jobs with Gemini
-  Phase 3 — APPLY   : Fill and submit application forms
+Phase 1 — SEARCH   : Open browser, search DDG, collect Lever/Ashby job URLs
+Phase 2 — READ     : Visit each URL, scroll through, AI Eye reads + scores
+Phase 3 — APPLY    : Fill forms visually, submit, confirm success
+
+The agent runs inside one persistent browser context per user so cookies
+and sessions survive across daily runs (avoids re-login challenges).
 """
 import logging
 from datetime import datetime
 from pathlib import Path
 
+from playwright.async_api import async_playwright
 from sqlalchemy import select
 
+from config import TIER_DAILY_LIMITS, get_daily_limit
 from database import AsyncSessionLocal
 from models.application import AgentRun, Application
 from models.user import JobPreference, User
@@ -20,39 +25,41 @@ logger = logging.getLogger(__name__)
 _PROFILES_DIR = Path(__file__).parent / "profiles"
 
 
+# ---------------------------------------------------------------------------
+# Public entry points
+# ---------------------------------------------------------------------------
+
 async def run_agent_for_all_users() -> None:
-    """Entry point for the daily scheduled run — processes all enabled users."""
+    """Scheduled daily run — processes every enabled user."""
     async with AsyncSessionLocal() as db:
         result = await db.execute(
-            select(User).where(User.agent_enabled == True, User.is_active == True)
+            select(User).where(User.agent_enabled.is_(True), User.is_active.is_(True))
         )
         users = result.scalars().all()
 
-    logger.info(f"Daily run: {len(users)} user(s) to process")
+    logger.info(f"Daily run: {len(users)} user(s)")
     for user in users:
         try:
             await run_agent_for_user(str(user.id))
         except Exception as e:
-            logger.error(f"Agent run failed for user {user.id}: {e}", exc_info=True)
+            logger.error(f"Agent run failed for {user.id}: {e}", exc_info=True)
 
 
 async def run_agent_for_user(user_id: str) -> None:
-    """Full pipeline for one user — creates an AgentRun record, then runs all 3 phases."""
+    """Full 3-phase pipeline for one user."""
     async with AsyncSessionLocal() as db:
-        # Load user
-        u_result = await db.execute(select(User).where(User.id == user_id))
-        user = u_result.scalar_one_or_none()
+        u = await db.execute(select(User).where(User.id == user_id))
+        user = u.scalar_one_or_none()
         if not user:
             logger.warning(f"User {user_id} not found")
             return
 
-        # Load preferences
-        p_result = await db.execute(
-            select(JobPreference).where(JobPreference.user_id == user_id)
-        )
-        preferences = p_result.scalar_one_or_none()
+        p = await db.execute(select(JobPreference).where(JobPreference.user_id == user_id))
+        preferences = p.scalar_one_or_none()
 
-        # Create run record
+        # Check tier daily limit
+        daily_limit = get_daily_limit(user.tier)
+
         run = AgentRun(
             user_id=user.id,
             status="running",
@@ -61,73 +68,89 @@ async def run_agent_for_user(user_id: str) -> None:
         db.add(run)
         await db.commit()
 
-        log: list[str] = []
+    log: list[str] = []
 
-        def emit(msg: str) -> None:
-            ts = datetime.utcnow().strftime("%H:%M:%S")
-            log.append(f"[{ts}] {msg}")
-            logger.info(f"[{user.email}] {msg}")
+    def emit(msg: str) -> None:
+        ts = datetime.utcnow().strftime("%H:%M:%S")
+        log.append(f"[{ts}] {msg}")
+        logger.info(f"[{getattr(user, 'email', user_id)}] {msg}")
 
-        try:
-            emit("Agent wakeup.")
+    try:
+        emit("Agent starting — initialising browser …")
 
-            if not preferences or not getattr(preferences, "job_titles", None):
-                emit("No job preferences configured — skipping.")
-                run.status = "skipped"
-                run.completed_at = datetime.utcnow()
-                run.log_output = "\n".join(log)
-                await db.commit()
-                return
+        if not preferences or not getattr(preferences, "job_titles", None):
+            emit("No job preferences configured — run skipped.")
+            await _finish_run(run, "skipped", log)
+            return
 
-            profile_dir = str(_PROFILES_DIR / str(user.id))
+        profile_dir = str(_PROFILES_DIR / str(user.id))
+        seed = str(user.id)
 
-            # ----------------------------------------------------------
-            # PHASE 1 — SEARCH
-            # ----------------------------------------------------------
-            emit("PHASE 1: Searching for jobs …")
-            from agent.search import discover_jobs
-            raw_jobs = await discover_jobs(user, preferences, profile_dir)
-            emit(f"Found {len(raw_jobs)} job listing(s).")
-            run.total_jobs_found = len(raw_jobs)
-            await db.commit()
+        async with async_playwright() as pw:
+            from agent.browser.context import new_context
+            from agent.vision.ai_eye import AIEye
 
-            if not raw_jobs:
-                emit("No jobs found — ending run.")
-                run.status = "completed"
-                run.completed_at = datetime.utcnow()
-                run.log_output = "\n".join(log)
-                await db.commit()
-                return
+            ctx = await new_context(pw, profile_dir)
+            eye = AIEye()
 
-            # ----------------------------------------------------------
-            # PHASE 2 — PLAN
-            # ----------------------------------------------------------
-            emit("PHASE 2: Scoring jobs …")
-            from agent.planner import plan_jobs
-            planned = await plan_jobs(user, raw_jobs, preferences)
-            emit(f"{len(planned)} job(s) passed the match threshold.")
+            try:
+                # ----------------------------------------------------------
+                # PHASE 1 — SEARCH
+                # ----------------------------------------------------------
+                emit("PHASE 1 — Searching for jobs …")
+                from agent.phases.searcher import find_jobs
+                raw_jobs = await find_jobs(ctx, user, preferences, eye, seed)
+                emit(f"Found {len(raw_jobs)} job listing(s) to evaluate.")
 
-            if not planned:
-                emit("No jobs passed scoring — ending run.")
-                run.status = "completed"
-                run.total_skipped = len(raw_jobs)
-                run.completed_at = datetime.utcnow()
-                run.log_output = "\n".join(log)
-                await db.commit()
-                return
+                async with AsyncSessionLocal() as db:
+                    run.total_jobs_found = len(raw_jobs)
+                    await db.merge(run)
+                    await db.commit()
 
-            # ----------------------------------------------------------
-            # PHASE 3 — APPLY
-            # ----------------------------------------------------------
-            emit("PHASE 3: Applying to jobs …")
-            from agent.applicator import Applicator
-            applicator = Applicator(user, preferences, profile_dir)
-            results = await applicator.run(planned)
+                if not raw_jobs:
+                    emit("No jobs found — ending run.")
+                    await _finish_run(run, "completed", log)
+                    return
 
-            # Record results
-            n_submitted = n_skipped = n_failed = 0
-            from agent.notifications.service import send_success_email
+                # ----------------------------------------------------------
+                # PHASE 2 — READ / EVALUATE
+                # ----------------------------------------------------------
+                emit("PHASE 2 — Reading and evaluating job listings …")
+                from agent.phases.reader import evaluate_jobs
+                good_jobs = await evaluate_jobs(ctx, raw_jobs, user, preferences, eye, seed)
+                emit(f"{len(good_jobs)} job(s) passed evaluation (score ≥ 70).")
 
+                if not good_jobs:
+                    emit("No jobs passed evaluation — ending run.")
+                    async with AsyncSessionLocal() as db:
+                        run.total_skipped = len(raw_jobs)
+                        await db.merge(run)
+                        await db.commit()
+                    await _finish_run(run, "completed", log)
+                    return
+
+                # Apply daily tier limit
+                if daily_limit is not None:
+                    good_jobs = good_jobs[:daily_limit]
+                    emit(f"Tier limit applied: applying to {len(good_jobs)} job(s).")
+
+                # ----------------------------------------------------------
+                # PHASE 3 — APPLY
+                # ----------------------------------------------------------
+                emit("PHASE 3 — Applying to jobs …")
+                from agent.phases.applicator import apply_to_jobs
+                results = await apply_to_jobs(ctx, good_jobs, user, preferences, eye, seed)
+
+            finally:
+                await ctx.close()
+
+        # ------------------------------------------------------------------
+        # Record results
+        # ------------------------------------------------------------------
+        n_submitted = n_skipped = n_failed = 0
+        from agent.notifications.service import send_success_email
+
+        async with AsyncSessionLocal() as db:
             for res in results:
                 status = res["status"]
                 job = res["job"]
@@ -139,7 +162,7 @@ async def run_agent_for_user(user_id: str) -> None:
                 else:
                     n_failed += 1
 
-                db_app = Application(
+                app = Application(
                     user_id=user.id,
                     job_title=job.title,
                     company_name=job.company,
@@ -147,46 +170,56 @@ async def run_agent_for_user(user_id: str) -> None:
                     job_description=(job.description or "")[:2000],
                     platform=job.platform,
                     status=status,
-                    ai_match_score=job.match_score,
+                    ai_match_score=job.score / 100.0,
                     ai_reasoning=job.reasoning,
                     cover_note=job.cover_note,
                     error_message=res.get("error"),
                     applied_at=datetime.utcnow() if status == "submitted" else None,
                 )
-                db.add(db_app)
-
-                if status == "submitted":
-                    emit(f"Submitted: {job.title} @ {job.company}")
-                    try:
-                        await send_success_email(
-                            user_email=user.email,
-                            user_full_name=user.full_name,
-                            user_salutation=user.salutation,
-                            job_title=job.title,
-                            company_name=job.company,
-                            job_url=job.url,
-                            match_score=job.match_score / 100,
-                            applied_at=datetime.utcnow().strftime("%B %d, %Y at %H:%M UTC"),
-                            cover_note=job.cover_note,
-                        )
-                    except Exception as email_err:
-                        logger.warning(f"Email failed: {email_err}")
+                db.add(app)
 
             run.total_applied = n_submitted
             run.total_skipped = n_skipped
             run.total_failed = n_failed
-            run.status = "completed"
-            run.completed_at = datetime.utcnow()
-            emit(
-                f"Run complete — Submitted: {n_submitted}, "
-                f"Skipped: {n_skipped}, Failed: {n_failed}"
-            )
+            await db.merge(run)
+            await db.commit()
 
-        except Exception as e:
-            logger.error(f"Pipeline failed for {user.email}: {e}", exc_info=True)
-            run.status = "failed"
-            run.completed_at = datetime.utcnow()
-            log.append(f"[ERROR] {e}")
+        # Send email notifications for successful applications
+        for res in results:
+            if res["status"] == "submitted":
+                job = res["job"]
+                emit(f"Submitted: {job.title} @ {job.company} [{job.score}%]")
+                try:
+                    await send_success_email(
+                        user_email=user.email,
+                        user_full_name=user.full_name,
+                        user_salutation=user.salutation,
+                        job_title=job.title,
+                        company_name=job.company,
+                        job_url=job.url,
+                        match_score=job.score / 100.0,
+                        applied_at=datetime.utcnow().strftime("%B %d, %Y at %H:%M UTC"),
+                        cover_note=job.cover_note,
+                    )
+                except Exception as email_err:
+                    logger.warning(f"Email notification failed: {email_err}")
 
+        emit(
+            f"Run complete — Submitted: {n_submitted}, "
+            f"Skipped: {n_skipped}, Failed: {n_failed}"
+        )
+        await _finish_run(run, "completed", log)
+
+    except Exception as e:
+        logger.error(f"Pipeline crashed for {getattr(user, 'email', user_id)}: {e}", exc_info=True)
+        log.append(f"[FATAL] {e}")
+        await _finish_run(run, "failed", log)
+
+
+async def _finish_run(run: AgentRun, status: str, log: list[str]) -> None:
+    async with AsyncSessionLocal() as db:
+        run.status = status
+        run.completed_at = datetime.utcnow()
         run.log_output = "\n".join(log)
+        await db.merge(run)
         await db.commit()
