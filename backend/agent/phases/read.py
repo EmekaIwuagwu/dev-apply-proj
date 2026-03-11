@@ -143,10 +143,10 @@ class ReadPhase:
         2. Visit each URL inside the same context to fetch the full description.
         """
         logger.info(f"DDG search: {query!r}")
+        # Only target ATS platforms that are not blocked (no captcha, automatable)
         full_query = (
             f"{query} "
-            "(site:lever.co OR site:ashbyhq.com OR "
-            "site:boards.greenhouse.io OR site:workable.com)"
+            "(site:jobs.lever.co OR site:jobs.ashbyhq.com)"
         )
         all_jobs: List[RawJob] = []
 
@@ -423,16 +423,13 @@ class ReadPhase:
 
 def _company_from_url(url: str) -> str:
     """Extract a company slug from well-known ATS URL patterns."""
-    patterns = [
-        ("lever.co/", 1),
-        ("greenhouse.io/", 1),
-        ("ashbyhq.com/", 1),
-        ("workable.com/", 1),
-    ]
-    for pattern, segment_index in patterns:
+    # e.g. https://jobs.lever.co/acmecorp/role-id  → "acmecorp"
+    # e.g. https://jobs.ashbyhq.com/acmecorp/role-id → "acmecorp"
+    patterns = ["jobs.lever.co/", "jobs.ashbyhq.com/"]
+    for pattern in patterns:
         if pattern in url:
             try:
-                return url.split(pattern)[1].split("/")[segment_index - 1]
+                return url.split(pattern)[1].split("/")[0]
             except IndexError:
                 pass
     return "Unknown"
